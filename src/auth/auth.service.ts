@@ -1,30 +1,44 @@
 import { Injectable } from '@nestjs/common';
-import { ConfigService } from '@nestjs/config';
-import { JwtService } from '@nestjs/jwt';
+import { InjectRedis } from '@nestjs-modules/ioredis';
 import Redis from 'ioredis';
-import { UsersService } from '../users/users.service';
-
-function sixDigit() { return Math.floor(100000 + Math.random() * 900000).toString(); }
+import { JwtService } from '@nestjs/jwt';
 
 @Injectable()
 export class AuthService {
-  private redis: Redis;
-  constructor(private cfg: ConfigService, private jwt: JwtService, private users: UsersService) {
-    this.redis = new Redis(this.cfg.get<string>('REDIS_URL') || 'redis://localhost:6379');
-  }
+  constructor(
+    @InjectRedis() private readonly redis: Redis,
+    private readonly jwt: JwtService,
+  ) {}
+
+  // 3 dakika geçerli OTP üret
   async requestOtp(phone: string) {
-    const code = sixDigit();
-    await this.redis.set(`otp:${phone}`, code, 'EX', 300);
-    const dev = this.cfg.get<string>('NODE_ENV') !== 'production';
-    return { ok: true, devCode: dev ? code : undefined };
+    const code = Math.floor(100000 + Math.random() * 900000).toString();
+
+    // ÖNEMLİ: OTP'yi Redis'e yaz ve süresini ayarla (EX = saniye)
+    // Key: otp:<telefon>
+    await this.redis.set(`otp:${phone}`, code, 'EX', 180);
+
+    // local geliştirme için devCode döndürüyoruz ki ekranda görebilin
+    return { ok: true, devCode: code };
   }
+
   async verifyOtp(phone: string, code: string) {
-    const key = `otp:${phone}`;
-    const stored = await this.redis.get(key);
-    if (!stored || stored !== code) return { ok: false, reason: 'INVALID_CODE' } as const;
-    await this.redis.del(key);
-    const user = await this.users.upsertByPhone(phone);
-    const accessToken = await this.jwt.signAsync({ sub: user.id, phone: user.phone });
-    return { ok: true, accessToken, user } as const;
+    // Redis'ten oku
+    const stored = await this.redis.get(`otp:${phone}`);
+
+    if (!stored) {
+      return { ok: false, reason: 'OTP_exired_or_missing' };
+    }
+    if (stored !== code) {
+      return { ok: false, reason: 'OTP_mismatch' };
+    }
+
+    // Doğrulandı: kodu bir daha kullanılmasın diye sil
+    await this.redis.del(`otp:${phone}`);
+
+    // Token üret (örnek payload)
+    const accessToken = await this.jwt.signAsync({ sub: phone });
+
+    return { ok: true, accessToken };
   }
 }
